@@ -1,5 +1,5 @@
 #!/bin/bash
-# slow-diag.sh v1.0 | Levamo/Rapyd | diagnostico read-only de avisos "Slow response" del monitor
+# slow-diag.sh v1.1 | Levamo/Rapyd | diagnostico read-only de avisos "Slow response" del monitor
 # uso: slow-diag.sh <dominio|slug> [--hours 12] [--samples 5] [--thr 2] [--no-db] [--php-probe]
 #      slow-diag.sh --all [--thr 2]     tabla de una linea por cada site del nodo
 # etiquetas: CONF medido/leido en esta corrida | IND indicio, falta 2do angulo | BUG defecto de plataforma
@@ -16,7 +16,7 @@ while [ $# -gt 0 ]; do case $1 in
   -h|--help) sed -n '2,8p' "$0"; exit 0;; -*) echo "opcion desconocida: $1"; exit 1;; *) TGT=$1;; esac; shift; done
 HC=$CONF/httpd_config.conf
 MUA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3 rapyd-cloud-uptime/1.0 (Rapyd Monitor 1.0)'
-BUA='Mozilla/5.0 (X11; Linux x86_64) slow-diag/1.0'
+BUA='Mozilla/5.0 (X11; Linux x86_64) slow-diag/1.1'; IDLE=${IDLE:-360}
 AWK=$(command -v gawk || command -v awk); GAWK=0; "$AWK" --version 2>/dev/null | grep -q GNU && GAWK=1
 TMPD=$(mktemp -d); PF=; trap 'rm -rf "$TMPD"; [ -n "$PF" ] && rm -f "$PF"' EXIT
 FIND=()
@@ -37,21 +37,21 @@ doms_of_slug(){ awk -v r="$HOMEB/web_$1/web" '
 hv(){ local v; v=$(grep -i "^$1:" "$TMPD/h" 2>/dev/null | tail -1 | cut -d: -f2- | tr -d '\r '); echo "${v:--}"; }
 # probe <url> <ua> <lb|cf> -> "code ttfb total bytes lsc cfcache bypass"
 probe(){ local r ca=(-s -o /dev/null -D "$TMPD/h" --max-time 60 -A "$2")
-  [ "$3" = lb ] && ca+=(-k --resolve "$DOM:443:$LB")
-  : > "$TMPD/h"; r=$(curl "${ca[@]}" -w '%{http_code} %{time_starttransfer} %{time_total} %{size_download}' "$1" 2>/dev/null)
-  r=$(echo "${r:-000 0 0 0}" | awk '{printf "%s %.3f %.3f %s",$1,$2,$3,$4}')
-  echo "$r $(hv x-litespeed-cache) $(hv cf-cache-status) $(hv x-rapyd-bypass-reason)"; }
-# series <nombre> <url> <ua> <lb|cf> <n> <bust 0|1>
+  [ "$3" = lb ] && ca+=(-k --resolve "$DOM:443:$LB"); [ "$4" = L ] && ca+=(-L)
+  : > "$TMPD/h"; r=$(curl "${ca[@]}" -w '%{http_code} %{time_starttransfer} %{time_total} %{size_download} %{num_redirects}' "$1" 2>/dev/null)
+  r=$(echo "${r:-000 0 0 0 0}" | awk '{printf "%s %.3f %.3f %s %d",$1,$2,$3,$4,$5}'); local x1 x2 x3 x4 x5; read -r x1 x2 x3 x4 x5 <<<"$r"
+  echo "$x1 $x2 $x3 $x4 $(hv x-litespeed-cache) $(hv cf-cache-status) $(hv x-rapyd-bypass-reason) $x5"; }
+# series <nombre> <url> <ua> <lb|cf> <n> <bust 0|1> [L = seguir redirects]
 series(){ local i u o; : > "$TMPD/s_$1"
   for i in $(seq "$5"); do u=$2; [ "$6" = 1 ] && u="$2?rCache=$(date +%s%3N)"
-    o=$(probe "$u" "$3" "$4"); echo "$o" >> "$TMPD/s_$1"
-    read -r c t tt b l cf by <<<"$o"
-    printf '        %-7s #%d code=%s ttfb=%ss total=%ss %sB lsc=%s cf=%s bypass=%s\n' "$1" "$i" "$c" "$t" "$tt" "$b" "$l" "$cf" "$by"
+    o=$(probe "$u" "$3" "$4" "$7"); echo "$o" >> "$TMPD/s_$1"
+    read -r c t tt b l cf by rd <<<"$o"
+    printf '        %-7s #%d code=%s ttfb=%ss total=%ss %sB lsc=%s cf=%s bypass=%s redir=%s\n' "$1" "$i" "$c" "$t" "$tt" "$b" "$l" "$cf" "$by" "$rd"
   done; }
-st3(){ awk '{print $2}' "$TMPD/s_$1" | sort -n | awk '{a[NR]=$1} END{if(NR)print a[1],a[int((NR+1)/2)],a[NR]; else print "0 0 0"}'; }
+st3(){ awk -v c="${2:-2}" '{print $c}' "$TMPD/s_$1" | sort -n | awk '{a[NR]=$1} END{if(NR)print a[1],a[int((NR+1)/2)],a[NR]; else print "0 0 0"}'; }
 hits(){ awk 'NR>1 && tolower($5)~/hit/' "$TMPD/s_$1" | wc -l; }
 vkey(){ awk -v k="$(echo "$1" | tr 'A-Z' 'a-z')" 'tolower($1)==k{print $2;exit}' "$2" 2>/dev/null; }
-venv(){ grep -oE "$1=[0-9]+" "$2" 2>/dev/null | head -1 | cut -d= -f2; }
+venv(){ grep -oiE "$1=-?[0-9]+" "$2" 2>/dev/null | head -1 | cut -d= -f2; }
 
 # ================= modo --all
 if [ "$ALL" = 1 ]; then
@@ -110,27 +110,36 @@ say INFO "carga: $(cut -d' ' -f1-3 /proc/loadavg) nproc=$(nproc) uptime=$(uptime
 
 # ================= 2 medicion en vivo (loopback, sin Cloudflare) + via Cloudflare
 hdr "2 medicion en vivo ($SAMPLES muestras, loopback $LB con SNI $DOM)"
+PB=$(pgrep -u "$U" -f lsphp 2>/dev/null | wc -l); PO=$(ps -u "$U" -o etimes=,args= 2>/dev/null | grep '[l]sphp' | sort -rn | awk 'NR==1{print $1}')
+say INFO "pool lsphp antes de medir: $PB procesos${PO:+, el mas viejo ${PO}s}"
+say INFO "monitor = / con ?rCache y UA del monitor, siguiendo redirects (total = cadena completa):"
+series monitor "https://$DOM/" "$MUA" lb "$SAMPLES" 1 L
 series static "https://$DOM/wp-includes/js/jquery/jquery.min.js" "$BUA" lb "$SAMPLES" 0
 series home "https://$DOM/" "$BUA" lb "$SAMPLES" 0
 series busted "https://$DOM/" "$MUA" lb "$SAMPLES" 1
 say INFO "via Cloudflare (IP publica, URL y UA del monitor):"
 series cf "https://$DOM/" "$MUA" cf 3 1
 read -r _ SMED _ <<<"$(st3 static)"; read -r _ HMED _ <<<"$(st3 home)"; read -r BMIN BMED BMAX <<<"$(st3 busted)"
-read -r _ CMED _ <<<"$(st3 cf)"
+read -r _ CMED _ <<<"$(st3 cf)"; read -r MMIN MMED MMAX <<<"$(st3 monitor 3)"
+M1=$(awk 'NR==1{print $3}' "$TMPD/s_monitor"); MRD=$(awk '{print $8}' "$TMPD/s_monitor" | sort -u | tr '\n' ' ')
 HC0=$(awk '{print $1}' "$TMPD/s_home" | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
 BC0=$(awk '{print $1}' "$TMPD/s_busted" | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
 HH=$(hits home); BH=$(awk 'tolower($5)~/hit/' "$TMPD/s_busted" | wc -l); BYP=$(awk '$7!="-"{print $7}' "$TMPD/s_home" | sort -u | tr '\n' ' ')
+say INFO "monitor 1ra=${M1}s min/med/max=${MMIN}/${MMED}/${MMAX}s redirects=${MRD}"
 say INFO "static med=${SMED}s | home med=${HMED}s hits=$HH/$((SAMPLES-1)) | busted min/med/max=${BMIN}/${BMED}/${BMAX}s | cf med=${CMED}s"
 if [ "$HC0" = 000 ]; then fnd SD LOOPBACK CHECK "loopback a $LB:443 no respondio (code 000): seccion 2 sin datos"
 else
   case $HC0 in 30[1278]) say INFO "home responde $HC0 -> $(curl -sk -o /dev/null -w '%{redirect_url}' --resolve "$DOM:443:$LB" "https://$DOM/")";; esac
   case $BC0 in 401|403) fnd IND ORIGIN_DENIES CHECK "origen responde $BC0 a la URL del monitor: el monitor estaria midiendo una pagina de error/auth (staging?)";; esac
   ge "$SMED" 1 && fnd IND STATIC_SLOW CHECK "un .js estatico tarda ${SMED}s por loopback: problema a nivel nodo/LiteSpeed (carga, cola, disco), no PHP"
-  [ "$HH" = 0 ] && [ "$SAMPLES" -gt 1 ] && fnd CONF CACHE_NO_HIT FIX-OK "la home no dio HIT en ninguna repeticion (bypass: ${BYP:--}); ver seccion 4 cache y seccion 6 LSCWP"
+  [ "$PB" = 0 ] && [ "$SAMPLES" -gt 1 ] && ge "$M1" "$THR" && ge "$M1" "$(awk -v m="$MMED" 'BEGIN{print m*2}')" && \
+    fnd CONF COLD_START CHECK "pool sin procesos antes de medir: 1ra sonda ${M1}s, mediana ${MMED}s (arranque en frio, esta medicion)"
+  ge "$MMED" "$THR" && fnd CONF MONITOR_CHAIN_SLOW CHECK "la cadena del monitor (redirects=${MRD% }) tarda mediana ${MMED}s con el pool caliente (esta medicion)"
+  [ "$HC0" = 200 ] && [ "$HH" = 0 ] && [ "$SAMPLES" -gt 1 ] && fnd CONF CACHE_NO_HIT FIX-OK "la home no dio HIT en ninguna repeticion (bypass: ${BYP:--}); ver seccion 4 cache y seccion 6 LSCWP"
   [ "$BH" -gt 0 ] && say INFO "la URL con ?rCache se sirvio desde cache $BH veces (drop_qs activo o similar)"
   if ge "$BMED" "$THR"; then
     fnd CONF GEN_SLOW CHECK "generacion sin cache mediana ${BMED}s (max ${BMAX}s) en $SAMPLES muestras AHORA; vale para esta medicion, no para la ventana del aviso"
-    [ "$HH" -gt 0 ] && ! ge "$HMED" 1 && fnd CONF MONITOR_BUSTS_CACHE PLAT "?rCache da MISS y la home normal da HIT en ${HMED}s: el monitor mide generacion PHP sin cache, no lo que ve un visitante"
+    [ "$HC0" = 200 ] && [ "$HH" -gt 0 ] && ! ge "$HMED" 1 && fnd CONF MONITOR_BUSTS_CACHE PLAT "?rCache da MISS y la home normal da HIT en ${HMED}s: el monitor mide generacion PHP sin cache, no lo que ve un visitante"
   else say OK "generacion sin cache ${BMED}s < ${THR}s en este momento"; fi
 fi
 
@@ -151,10 +160,10 @@ else
   { i=index($1,"["); if(!i)next; t=substr($1,i+1,20); e=ep(t); if(e<=0)next
     lb=(mx>e)?mx-e:0; if(e>mx)mx=e; if(e<since)next
     if(!f1)f1=t; fl=t; split($3,b," "); st=b[1]; split($2,q," "); u=q[2]; p=u; sub(/\?.*/,"",p)
-    ip=substr($1,1,index($1," ")-1); n++; S[st]++; hr=substr(t,1,14); H[hr]++; if(st~/^5/){H5[hr]++;e5++}
+    ip=substr($1,1,index($1," ")-1); if($6~/^WordPress\//)WPU[ip]++; n++; S[st]++; hr=substr(t,1,14); H[hr]++; if(st~/^5/){H5[hr]++;e5++}
     if(lb>=10)H10[hr]++; R[substr(t,1,17)]++; I[ip]++
     if(lb>=thr){ns++;SL[p]++;if(lb>SX[p])SX[p]=lb}
-    if($6~/rapyd-cloud-uptime/){m++;MS[st]++;if(lb>mmx)mmx=lb;if(lb>=thr){msl++;ML[msl]=t" >="lb"s "st}}
+    if($6~/rapyd-cloud-uptime/){m++;MS[st]++;MP[p" "st]++;if(lb>mmx)mmx=lb;if(lb>=thr){msl++;ML[msl]=t" >="lb"s "st}}
     if(p~/xmlrpc\.php$/)xr++; if(q[1]=="POST"&&p~/wp-login\.php$/)lg++; if(u~/add-to-cart=/)atc++
     if(p~/\/wp-json\/wc\/store/)wcs++; if(p~/wp-cron\.php$/)cr++; if(p~/admin-ajax\.php$/)aj++
     if(st=="404"&&p~/^\/wp-(content|includes)\/.*\.(js|css|png|jpe?g|gif|webp|svg|woff2?|ttf)$/){s4++;S4[p]++}
@@ -165,6 +174,7 @@ else
     c="sort"; for(h in H)printf "          %s  %6d %5d %5d\n",h,H[h],H5[h],H10[h] | c; close(c)
     printf "  INFO  sondas del monitor: %d, status:",m; for(s in MS)printf " %s=%d",s,MS[s]
     printf ", >=%ss (cota inferior): %d, max >=%ds\n",thr,msl,mmx; k=(msl>6)?msl-5:1
+    printf "  INFO  sondas por ruta:"; for(x in MP)printf " [%s]=%d",x,MP[x]; print ""
     for(j=k;j<=msl;j++)print "          "ML[j]
     for(r in R)if(R[r]>pk){pk=R[r];pkm=r}; printf "  INFO  pico %d req/min (%s)\n",pk,pkm
     print "  INFO  top IPs:"; fflush(); c="sort -k2 -rn | head -6"; for(x in I)printf "          %-40s %d\n",x,I[x] | c; close(c)
@@ -173,7 +183,7 @@ else
     c="sort -k2 -rn | head -10"; for(x in SL)printf "          %-60s %5d  max>=%ds\n",substr(x,1,60),SL[x],SX[x] | c; close(c)
     printf "  INFO  patrones: xmlrpc=%d wp-login-POST=%d add-to-cart=%d wc-store-api=%d wp-cron=%d admin-ajax=%d static-404=%d\n",xr,lg,atc,wcs,cr,aj,s4
     if(s4){fflush(); c="sort -k2 -rn | head -5"; for(x in S4)printf "          404 %-60s %d\n",substr(x,1,60),S4[x] | c; close(c)}
-    printf "AL_N=%d\nAL_M=%d\nAL_MSL=%d\nAL_MMX=%d\nAL_NS=%d\nAL_PK=%d\nAL_TI=%d\nAL_TIP=\"%s\"\nAL_5=%d\nAL_S4=%d\nAL_XR=%d\nAL_LG=%d\nAL_ATC=%d\nAL_WCS=%d\n",n,m,msl,mmx,ns,pk,ti,tip,e5,s4,xr,lg,atc,wcs > kv }'
+    printf "AL_TIWP=%d\nAL_N=%d\nAL_M=%d\nAL_MSL=%d\nAL_MMX=%d\nAL_NS=%d\nAL_PK=%d\nAL_TI=%d\nAL_TIP=\"%s\"\nAL_5=%d\nAL_S4=%d\nAL_XR=%d\nAL_LG=%d\nAL_ATC=%d\nAL_WCS=%d\n",WPU[tip],n,m,msl,mmx,ns,pk,ti,tip,e5,s4,xr,lg,atc,wcs > kv }'
   # shellcheck disable=SC1091
   [ -s "$TMPD/kv" ] && . "$TMPD/kv"
   say INFO "cota inferior: una linea se escribe al terminar; si antes se escribio una recibida mas tarde, duro al menos esa diferencia. Con poco trafico la cota da 0 aunque haya sido lento."
@@ -181,7 +191,26 @@ else
   elif [ "${AL_MSL:-0}" -gt 0 ]; then fnd IND MONITOR_SLOW_LB CHECK "$AL_MSL de $AL_M sondas del monitor tardaron >=${THR}s (cota inferior; max >=${AL_MMX}s)"
   else say OK "ninguna sonda del monitor muestra inversion >=${THR}s (no prueba que fueran rapidas si el trafico es bajo)"; fi
   [ "${AL_5:-0}" -gt 0 ] && fnd IND HTTP_5XX CHECK "$AL_5 respuestas 5xx en la ventana (ver por hora arriba; 500 LiteSpeed vs fatal PHP se distingue en secciones 4 y 5)"
-  [ "${AL_N:-0}" -gt 2000 ] && [ $((AL_TI*100/AL_N)) -ge 20 ] && fnd IND TRAFFIC_CONCENTRATED CUST "la IP $AL_TIP hizo $AL_TI de $AL_N requests ($((AL_TI*100/AL_N))%)"
+  if [ "${AL_N:-0}" -gt 2000 ] && [ $((AL_TI*100/AL_N)) -ge 20 ]; then
+    if [ $((AL_TIWP*100/(AL_TI>0?AL_TI:1))) -ge 80 ]; then say INFO "la IP top $AL_TIP ($AL_TI req) es loopback de WordPress (UA WordPress/): IP de salida del nodo, no visitantes"
+    else fnd IND TRAFFIC_CONCENTRATED CUST "la IP $AL_TIP hizo $AL_TI de $AL_N requests ($((AL_TI*100/AL_N))%)"; fi; fi
+  # duracion de "/" por pares de la misma IP del monitor (cuando sigue redirect) vs tiempo sin trafico previo
+  echo "$ALF" | xargs zcat -f 2>/dev/null | "$AWK" -F'"' 'BEGIN{split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec",M," ");for(i=1;i<=12;i++)mi[M[i]]=i}
+    {i=index($1,"[");if(!i)next;t=substr($1,i+1,20);e=mktime(substr(t,8,4)" "mi[substr(t,4,3)]" "substr(t,1,2)" "substr(t,13,2)" "substr(t,16,2)" "substr(t,19,2))
+     split($1,a," ");split($2,r," ");p=r[2];sub(/\?.*/,"",p);split($3,s," ");print e,a[1],p,s[1],($6~/rapyd-cloud-uptime/)?"M":"-"}' \
+  | sort -n -s -k1,1 | "$AWK" -v since="$SINCE" -v thr="$THR" -v idle="$IDLE" -v kv="$TMPD/kv2" '
+    $5=="M"&&$3=="/"&&$4~/^30/{rt[$2]=$1;gp[$2]=$1-last;last=$1;next}
+    $5=="M"&&($2 in rt)&&$1-rt[$2]<120{if(rt[$2]>=since){d=$1-rt[$2];b=(gp[$2]>=idle)?"I":"W";n[b]++;sm[b]+=d;if(d>=thr)sl[b]++;if(d>mx[b])mx[b]=d};delete rt[$2];last=$1;next}
+    {last=$1}
+    END{if(n["I"]+n["W"]==0){print "  INFO  sin pares de sonda / -> redirect en la ventana";exit}
+      print "  INFO  duracion de / del monitor (hasta su siguiente pedido, misma IP) segun tiempo sin trafico previo:"
+      printf "          sin trafico >=%ds: %4d sondas prom %.1fs max %ds >=%ss: %d\n",idle,n["I"],n["I"]?sm["I"]/n["I"]:0,mx["I"],thr,sl["I"]
+      printf "          con trafico  <%ds: %4d sondas prom %.1fs max %ds >=%ss: %d\n",idle,n["W"],n["W"]?sm["W"]/n["W"]:0,mx["W"],thr,sl["W"]
+      printf "PI_N=%d\nPI_A=%.1f\nPW_N=%d\nPW_A=%.1f\n",n["I"],n["I"]?sm["I"]/n["I"]:0,n["W"],n["W"]?sm["W"]/n["W"]:0 > kv}'
+  # shellcheck disable=SC1091
+  [ -s "$TMPD/kv2" ] && . "$TMPD/kv2"
+  if [ "${PI_N:-0}" -ge 5 ] && [ "${PW_N:-0}" -ge 5 ] && ge "$PI_A" "$THR" && ge "$PI_A" "$(awk -v w="$PW_A" 'BEGIN{print w*2}')"; then
+    fnd IND IDLE_COLD FIX "tras >=${IDLE}s sin trafico la / del monitor promedia ${PI_A}s ($PI_N sondas) contra ${PW_A}s con trafico previo ($PW_N): el pool arranca en frio"; fi
   { [ "${AL_XR:-0}" -gt 500 ] || [ "${AL_LG:-0}" -gt 200 ] || [ "${AL_ATC:-0}" -gt 300 ] || [ "${AL_WCS:-0}" -gt 300 ]; } && \
     fnd IND ABUSE_PATTERN CUST "volumen alto en endpoints de abuso (xmlrpc=$AL_XR login-POST=$AL_LG add-to-cart=$AL_ATC store-api=$AL_WCS)"
   [ "${AL_S4:-0}" -gt 50 ] && fnd IND STATIC_404 CUST "$AL_S4 404 sobre assets de wp-content/wp-includes: cada uno arranca WordPress completo"
@@ -191,11 +220,12 @@ fi
 hdr "4 LiteSpeed y pool LSAPI"
 INST=$(vkey instances "$VC"); MAXC=$(vkey maxConns "$VC"); CH=$(venv PHP_LSAPI_CHILDREN "$VC"); EX=$(venv LSAPI_EXTRA_CHILDREN "$VC")
 say INFO "vhconf: instances=${INST:--} maxConns=${MAXC:--} PHP_LSAPI_CHILDREN=${CH:--} LSAPI_EXTRA_CHILDREN=${EX:--} memHardLimit=$(vkey memHardLimit "$VC")"
-CFL=$(grep -iE '^\s*(enableCache|ls_enabled)\s' "$VC" 2>/dev/null | awk '{printf "%s=%s ",$1,$2}')
+CFL=$(grep -iE '^\s*(enableCache|ls_enabled)\s' "$VC" 2>/dev/null | awk '{print $1"="$2}' | sort -u | tr '\n' ' ')
+say INFO "pool idle: runOnStartUp=$(vkey runOnStartUp "$VC") autoStart=$(vkey autoStart "$VC") maxIdleTime=$(vkey maxIdleTime "$VC") LSAPI_PGRP_MAX_IDLE=$(venv LSAPI_PGRP_MAX_IDLE "$VC") PHP_LSAPI_MAX_IDLE=$(venv PHP_LSAPI_MAX_IDLE "$VC") (vacio = default)"
 say INFO "cache vhost: ${CFL:-sin claves enableCache/ls_enabled}"
 say INFO "rapyd config php.max-workers: $(rapyd config get --key php.max-workers --slug "$SLUG" 2>&1 | tr '\n' ' ' | cut -c1-100)"
 say INFO "rapyd config cache.enable:    $(rapyd config get --key cache.enable --slug "$SLUG" 2>&1 | tr '\n' ' ' | cut -c1-100)"
-if echo "$CFL" | grep -qE '=0( |$)'; then
+if echo "$CFL" | grep -q 'ls_enabled=0'; then
   if [ "${HH:-0}" -gt 0 ]; then fnd IND CACHE_OFF FIX-OK "vhconf dice cache apagado (${CFL% }) pero la home dio HIT $HH veces: verificar que config esta cargada"
   else fnd CONF CACHE_OFF FIX-OK "cache de LiteSpeed apagado en el vhconf (${CFL% }) y sin HIT en la seccion 2"; fi; fi
 # enforcement real: rtreport (root) EXTAPP del vhost
@@ -214,7 +244,13 @@ fi
 # vhconf escrito pero no cargado
 VT=$VC.txt
 if [ ! -f "$VT" ]; then fnd IND VHCONF_NOT_PARSED FIX "no existe vhconf.conf.txt: el vhost no fue parseado desde el ultimo cambio"
-elif [ "$VC" -nt "$VT" ]; then fnd IND VHCONF_NOT_LOADED FIX "vhconf.conf mas nuevo que vhconf.conf.txt: la config en disco no esta cargada (falta reload lsws)"
+elif [ "$VC" -nt "$VT" ]; then DK=
+  for k in instances maxConns runOnStartUp autoStart; do a=$(vkey "$k" "$VC"); b=$(vkey "$k" "$VT"); [ -n "$b" ] && [ "$a" != "$b" ] && DK="$DK $k:$b->$a"; done
+  a=$(venv PHP_LSAPI_CHILDREN "$VC"); b=$(venv PHP_LSAPI_CHILDREN "$VT"); [ -n "$b" ] && [ "$a" != "$b" ] && DK="$DK CHILDREN:$b->$a"
+  MT=$(stat -c %y "$VC" | cut -c1-19); PT=$(stat -c %y "$VT" | cut -c1-19)
+  if [ -n "$DK" ]; then fnd CONF VHCONF_NOT_LOADED FIX "vhconf escrito $MT, ultimo parseo $PT; difiere en:$DK"
+  else fnd IND VHCONF_NOT_LOADED CHECK "vhconf escrito $MT, ultimo parseo $PT; claves de pool iguales, el cambio es otro"; fi
+  for bk in "$VC.rsm.bk" "$VC.bak"; do [ -f "$bk" ] && { say INFO "diff $(basename "$bk") -> vhconf.conf:"; diff "$bk" "$VC" | head -12 | cut -c1-150 | sed 's/^/        /'; break; }; done
 else for k in instances maxConns; do a=$(vkey "$k" "$VC"); b=$(vkey "$k" "$VT")
   [ "$a" != "$b" ] && fnd IND VHCONF_DIFF FIX "$k en disco=$a y parseado=$b"; done; fi
 # error.log del servidor en la ventana
@@ -249,8 +285,9 @@ hdr "5 PHP"
 for f in "$PHPD"/*.ini; do [ -f "$f" ] || continue
   grep -HnE '^\s*(open_basedir|opcache\.(enable|memory_consumption|interned_strings_buffer|max_accelerated_files|revalidate_freq|validate_timestamps)|memory_limit|max_execution_time|realpath_cache_size)\s*=' "$f" \
    | sed "s#$PHPD/##" | cut -c1-160 | sed 's/^/        /'; done
-grep -qE '^\s*open_basedir\s*=\s*\S' "$PHPD"/*.ini 2>/dev/null && OB=1 || OB=0
-[ "$OB" = 1 ] && fnd BUG OPEN_BASEDIR PLAT "open_basedir definido en php/: PHP apaga el realpath cache en web (stat storm en sites grandes; escalado a Ayush)"
+OBL=$(grep -HE '^\s*open_basedir\s*=' "$PHPD"/*.ini 2>/dev/null | tail -1); OBV=$(echo "$OBL" | sed -E 's/^[^=]*=//; s/["[:space:]]//g')
+if [ -n "$OBV" ]; then OB=1; fnd BUG OPEN_BASEDIR PLAT "open_basedir efectivo en $(basename "${OBL%%:*}"): PHP apaga el realpath cache en web (escalado a Ayush)"
+else OB=0; [ -n "$OBL" ] && say OK "open_basedir anulado en $(basename "${OBL%%:*}") (ultimo en la cadena); runtime: --php-probe"; fi
 PE=$(find "$LOGD" -maxdepth 1 -name 'php_errors.log*' -mmin -$((HOURS*60+60)) 2>/dev/null | sort)
 if [ -n "$PE" ] && [ "$GAWK" = 1 ]; then
   echo "$PE" | xargs zcat -f 2>/dev/null | "$AWK" -v since="$SINCE" '
@@ -262,6 +299,7 @@ if [ -n "$PE" ] && [ "$GAWK" = 1 ]; then
   [ "$FT" -gt 0 ] && fnd CONF PHP_FATALS CUST "$FT fatales PHP en la ventana (500 de aplicacion, distinto de saturacion LiteSpeed)"
   [ "$MET" -gt 0 ] && fnd CONF PHP_TIMEOUTS CHECK "$MET requests cortados por max_execution_time"
   [ "$WN" -gt 50000 ] && fnd IND WARNING_FLOOD CUST "$WN warnings PHP en ${HOURS}h: escritura de log en cada request"
+elif [ -f "$LOGD/php_errors.log" ] && [ ! -s "$LOGD/php_errors.log" ]; then say INFO "php_errors.log vacio (mtime $(stat -c %y "$LOGD/php_errors.log" | cut -c1-10)): PHP no registra errores ahi"
 else say SD "sin php_errors.log en la ventana o sin gawk"; fi
 if [ "$PROBE" = 1 ] && [ -d "$WR" ]; then
   PF=$WR/sd-probe-$RANDOM$RANDOM.php
@@ -291,6 +329,8 @@ else say INFO "runtime opcache/realpath no medido (usar --php-probe)"; fi
 hdr "6 MariaDB y WordPress"
 MDB=mariadb; systemctl cat mariadb >/dev/null 2>&1 || MDB=mysql
 say INFO "$MDB: $(systemctl is-active $MDB 2>/dev/null) desde $(systemctl show $MDB -p ActiveEnterTimestamp --value 2>/dev/null) NRestarts=$(systemctl show $MDB -p NRestarts --value 2>/dev/null)"
+NRS=$(systemctl show $MDB -p NRestarts --value 2>/dev/null)
+[ "$(num "$NRS")" -gt 0 ] && fnd IND DB_RESTARTS CHECK "MariaDB con NRestarts=$NRS desde $(systemctl show $MDB -p ActiveEnterTimestamp --value 2>/dev/null): correr mariadb-diag.sh"
 AE=$(date -d "$(systemctl show $MDB -p ActiveEnterTimestamp --value 2>/dev/null)" +%s 2>/dev/null)
 [ -n "$AE" ] && [ "$AE" -ge "$SINCE" ] && fnd IND DB_RESTARTED CHECK "MariaDB arranco dentro de la ventana: correr mariadb-diag.sh"
 WC=$WR/wp-config.php
@@ -367,10 +407,17 @@ L1=$(cut -d' ' -f1 /proc/loadavg); NC=$(nproc)
 ge "$L1" $((NC*2)) && fnd IND NODE_LOAD CHECK "load1=$L1 con $NC CPUs"
 ps -eo pid,user,etimes,pcpu,rss,comm --sort=-pcpu | head -8 | sed 's/^/        /'
 free -m | awk 'NR==2{printf "        mem total=%sMB usada=%sMB disponible=%sMB\n",$2,$3,$7}'
-for f in /sys/fs/cgroup/memory/memory.failcnt /sys/fs/cgroup/memory.events; do [ -r "$f" ] && say INFO "$f: $(tr '\n' ' ' < "$f")"; done
+[ -r /sys/fs/cgroup/memory.events ] && say INFO "memory.events: $(tr '\n' ' ' < /sys/fs/cgroup/memory.events)"
 awk 'NR>2 && $NF>0 {print "        UBC failcnt: "$0}' /proc/user_beancounters 2>/dev/null | head -5
-for f in /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/cpu,cpuacct/cpu.stat /sys/fs/cgroup/cpu/cpu.stat; do
-  [ -r "$f" ] && say INFO "cpu.stat: $(grep -E 'nr_periods|nr_throttled|throttled' "$f" | tr '\n' ' ')" && break; done
+CS=; for f in /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/cpu,cpuacct/cpu.stat /sys/fs/cgroup/cpu/cpu.stat; do [ -r "$f" ] && { CS=$f; break; }; done
+FC=/sys/fs/cgroup/memory/memory.failcnt; [ -r "$FC" ] || FC=
+if [ -n "$CS$FC" ]; then
+  f1=$(cat "$FC" 2>/dev/null); t1=$(awk '$1=="nr_throttled"{print $2}' "$CS" 2>/dev/null); sleep 15
+  f2=$(cat "$FC" 2>/dev/null); t2=$(awk '$1=="nr_throttled"{print $2}' "$CS" 2>/dev/null)
+  say INFO "acumulados: failcnt=${f2:--} nr_throttled=${t2:--}; en 15s: failcnt +$(( ${f2:-0}-${f1:-0} )) nr_throttled +$(( ${t2:-0}-${t1:-0} ))"
+  [ $(( ${f2:-0}-${f1:-0} )) -gt 0 ] && fnd CONF MEM_LIMIT_NOW CHECK "el contenedor esta chocando el limite de memoria ahora (failcnt +$(( f2-f1 )) en 15s)"
+  [ $(( ${t2:-0}-${t1:-0} )) -gt 100 ] && fnd CONF CPU_THROTTLED_NOW CHECK "throttling de CPU ahora (+$(( t2-t1 )) periodos en 15s)"
+fi
 OOM=$(dmesg -T 2>/dev/null | grep -iE 'killed process' | tail -5)
 [ -n "$OOM" ] && { say INFO "ultimos OOM kills (dmesg, correlacionar hora):"; echo "$OOM" | cut -c1-150 | sed 's/^/        /'; }
 df -hP / /var/lib/mysql /home 2>/dev/null | awk 'NR>1' | sort -u | while read -r _ sz us _ pc mp; do
